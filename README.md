@@ -4,4 +4,4 @@
 GitHubの練習用プロジェクト
 
 ## 実行方法
-python main.py
+combine_textfiles.py
