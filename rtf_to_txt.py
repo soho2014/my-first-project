@@ -2,7 +2,8 @@
 """
 RTFファイルをテキストファイルに一括変換するスクリプト
 Shift_JIS (cp932) / UTF-8 混在対応
-2026/6/15 Claude修正
+標準ライブラリのみ使用
+2026/6/12 Claude修正
 """
 
 import re
@@ -26,70 +27,175 @@ def detect_encoding(raw: bytes) -> str:
 
 
 def rtf_to_text(raw: bytes) -> str:
-    """RTFバイナリからプレーンテキストを抽出する。"""
+    """
+    スタックベースのRTFパーサーでプレーンテキストを抽出する。
+
+    正規表現ベースの方法はグループのネスト処理が不完全になるため、
+    1文字ずつ解析するパーサーを使用する。
+    """
     encoding = detect_encoding(raw)
 
-    # ── UTF-8 RTF: バイト列に生のUTF-8が埋め込まれているケース ──
-    # latin-1 でデコードすると文字化けするので、先にUTF-8でデコードを試みる
+    # UTF-8 RTFは生のUTF-8バイト列が埋め込まれているのでそのままデコード。
+    # Shift_JIS RTFは \'xx エスケープで非ASCII文字が表現されるため latin-1 を使う。
     if encoding == 'utf-8':
         try:
             text = raw.decode('utf-8')
         except UnicodeDecodeError:
             text = raw.decode('latin-1')
     else:
-        # Shift_JIS RTF: \'xx エスケープで非ASCII文字が表現される
         text = raw.decode('latin-1')
 
-    # ── Step 1: 最外の {} を除去（しないと全テキストがグループとして消える）──
-    text = text.strip()
-    if text.startswith('{') and text.endswith('}'):
-        text = text[1:-1]
+    # スキップすべきグループ（フォントテーブル、画像、ハイパーリンク命令等）
+    SKIP_WORDS = {
+        'fonttbl', 'colortbl', 'stylesheet', 'listtable', 'listoverridetable',
+        'rsidtbl', 'generator', 'info', 'pict', 'object', 'fldinst',
+        'header', 'footer', 'headerl', 'headerr', 'footerl', 'footerr',
+        'footnote', 'annotation', 'upr',
+    }
 
-    # ── Step 2: \'xx エスケープを変換（Shift_JIS用、連続するものをまとめてデコード）──
-    if encoding == 'cp932':
-        def decode_hex_runs(s: str, enc: str) -> str:
-            def replacer(m):
-                hex_vals = re.findall(r"\\'([0-9a-fA-F]{2})", m.group(0))
-                hex_bytes = bytes([int(x, 16) for x in hex_vals])
-                return hex_bytes.decode(enc, errors='replace')
-            return re.sub(r"(?:\\'[0-9a-fA-F]{2})+", replacer, s)
-        text = decode_hex_runs(text, encoding)
+    output = []
+    stack  = []   # グループを抜けたときに skip を元に戻すためのスタック
+    skip   = False
+    i      = 0
+    n      = len(text)
 
-    # ── Step 3: 改行・タブ系制御ワードをテキストに変換 ──
-    text = re.sub(r'\\par\b *',  '\n', text)
-    text = re.sub(r'\\pard\b *', '',   text)
-    text = re.sub(r'\\line\b *', '\n', text)
-    text = re.sub(r'\\tab\b *',  '\t', text)
-    text = re.sub(r'\\page\b *', '\n\n', text)
-    text = re.sub(r'\\sect\b *', '\n\n', text)
-    text = re.sub(r'\\cell\b *', '\t', text)
-    text = re.sub(r'\\row\b *',  '\n', text)
+    while i < n:
+        c = text[i]
 
-    # ── Step 4: 内部グループを内側から除去（フォントテーブル等）──
-    for _ in range(30):
-        new = re.sub(r'\{[^{}]*\}', '', text)
-        if new == text:
-            break
-        text = new
+        # ── グループ開始 ──────────────────────────────────────────────
+        if c == '{':
+            stack.append(skip)
+            # {\* ...} は省略可能グループ（常にスキップ）
+            if text[i+1:i+3] == '\\*':
+                skip = True
+            i += 1
 
-    # ── Step 5: 残り制御ワード・制御記号・波括弧を除去 ──
-    text = re.sub(r'\\[a-zA-Z]+-?\d* *', '', text)
-    text = re.sub(r'\\[^a-zA-Z\n]',       '', text)
-    text = re.sub(r'[{}]',                 '', text)
+        # ── グループ終了 ──────────────────────────────────────────────
+        elif c == '}':
+            if stack:
+                skip = stack.pop()
+            i += 1
 
-    # ── Step 6: 整形（連続空行を最大2行に圧縮）──
-    lines = [line.rstrip() for line in text.splitlines()]
-    result, blank_count = [], 0
+        # ── 制御ワード / 制御記号 ─────────────────────────────────────
+        elif c == '\\':
+            i += 1
+            if i >= n:
+                break
+
+            nc = text[i]
+
+            if nc == '\\':                          # \\ → バックスラッシュ
+                if not skip: output.append('\\')
+                i += 1
+
+            elif nc == '{':                         # \{ → 左波括弧リテラル
+                if not skip: output.append('{')
+                i += 1
+
+            elif nc == '}':                         # \} → 右波括弧リテラル
+                if not skip: output.append('}')
+                i += 1
+
+            elif nc == '\n':                        # \<改行> → 段落区切り
+                if not skip: output.append('\n')
+                i += 1
+
+            elif nc == '~':                         # \~ → ノーブレークスペース
+                if not skip: output.append('\u00a0')
+                i += 1
+
+            elif nc == '-':                         # \- → オプショナルハイフン（無視）
+                i += 1
+
+            elif nc == '_':                         # \_ → ノーブレークハイフン
+                if not skip: output.append('-')
+                i += 1
+
+            elif nc == "'":                         # \'xx → バイトエスケープ
+                if i + 2 < n and re.match(r'[0-9a-fA-F]{2}', text[i+1:i+3]):
+                    if not skip:
+                        # 連続する \'xx をまとめてデコード（マルチバイト対応）
+                        hex_bytes = [int(text[i+1:i+3], 16)]
+                        j = i + 3
+                        while (j + 2 < n
+                               and text[j] == '\\'
+                               and text[j+1] == "'"
+                               and re.match(r'[0-9a-fA-F]{2}', text[j+2:j+4])):
+                            hex_bytes.append(int(text[j+2:j+4], 16))
+                            j += 4
+                        output.append(bytes(hex_bytes).decode(encoding, errors='replace'))
+                        i = j
+                    else:
+                        i += 3
+                else:
+                    i += 1
+
+            elif nc.isalpha():                      # \word → 制御ワード
+                j = i
+                while j < n and text[j].isalpha():
+                    j += 1
+                word = text[i:j]
+
+                # オプションの数値パラメータ
+                num_start = j
+                if j < n and (text[j] == '-' or text[j].isdigit()):
+                    if text[j] == '-': j += 1
+                    while j < n and text[j].isdigit(): j += 1
+                num_str = text[num_start:j]
+                num = int(num_str) if num_str and num_str != '-' else None
+
+                # 制御ワードの後続スペースは区切りとして消費
+                if j < n and text[j] == ' ':
+                    j += 1
+                i = j
+
+                if word in SKIP_WORDS:
+                    # このグループの終わり(})まで出力しない
+                    skip = True
+                elif word == 'fldrslt':
+                    # ハイパーリンクの表示テキスト部分は出力する
+                    skip = False
+                elif not skip:
+                    if   word == 'par':  output.append('\n')
+                    elif word == 'line': output.append('\n')
+                    elif word == 'tab':  output.append('\t')
+                    elif word == 'page': output.append('\n\n')
+                    elif word == 'sect': output.append('\n\n')
+                    elif word == 'cell': output.append('\t')
+                    elif word == 'row':  output.append('\n')
+                    elif word == 'u' and num is not None:
+                        # \uN? → Unicode文字（\uN の後の代替文字 ? をスキップ）
+                        code = num if num >= 0 else num + 65536
+                        output.append(chr(code))
+                        if i < n and text[i] == '?':
+                            i += 1
+                    # その他の制御ワード（フォント指定・書式等）は無視
+
+            else:
+                # 未知の制御記号は無視
+                i += 1
+
+        # ── 通常文字 ──────────────────────────────────────────────────
+        else:
+            if not skip:
+                output.append(c)
+            i += 1
+
+    result = ''.join(output)
+
+    # 整形：連続する空行を最大2行に圧縮
+    lines = [line.rstrip() for line in result.splitlines()]
+    out, blank_count = [], 0
     for line in lines:
         if line == '':
             blank_count += 1
             if blank_count <= 2:
-                result.append('')
+                out.append('')
         else:
             blank_count = 0
-            result.append(line)
+            out.append(line)
 
-    return '\n'.join(result).strip()
+    return '\n'.join(out).strip()
 
 
 def convert_folder(input_dir: str, output_dir: str | None, overwrite: bool) -> None:
@@ -112,12 +218,12 @@ def convert_folder(input_dir: str, output_dir: str | None, overwrite: bool) -> N
         txt_file = out_path / (rtf_file.stem + '.txt')
 
         if txt_file.exists() and not overwrite:
-            print(f"[SKIP] {rtf_file.name} → {txt_file.name} (--overwrite で上書き可)")
+            print(f"[SKIP] {rtf_file.name} → {txt_file.name}  (--overwrite で上書き可)")
             skipped += 1
             continue
 
         try:
-            raw = rtf_file.read_bytes()
+            raw  = rtf_file.read_bytes()
             text = rtf_to_text(raw)
             txt_file.write_text(text, encoding='utf-8')
             print(f"[OK]   {rtf_file.name} → {txt_file.name}")
@@ -140,7 +246,6 @@ def main():
     parser.add_argument('--overwrite', action='store_true',
                         help='既存の .txt ファイルを上書きする')
     args = parser.parse_args()
-
     convert_folder(args.input_dir, args.output_dir, args.overwrite)
 
 
