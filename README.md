@@ -1,4 +1,4 @@
-# files_to_txt
+# files_to_text
 
 ## 概要
 様々な形式のファイルをテキストに変換する
