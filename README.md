@@ -1,7 +1,7 @@
-# my-first-project
+# files_to_txt
 
 ## 概要
-GitHubの練習用プロジェクト
+様々な形式のファイルをテキストに変換する
 
 ## 実行方法
-python rtf_to_txt.py [rtf形式のファイルがあるフォルダ]
+python [pythonファイル名] [変換したいファイルがあるフォルダ]
