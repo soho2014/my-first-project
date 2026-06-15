@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
 RTFファイルをテキストファイルに一括変換するスクリプト
-Shift_JIS / UTF-8 混在に対応
-2026/6/15 Claudeが作成
+Shift_JIS (cp932) / UTF-8 混在対応
+2026/6/15 Claude修正
 """
 
 import re
-import os
 import sys
-import glob
 import argparse
 from pathlib import Path
 
 
-# ── RTFデコード用ユーティリティ ────────────────────────────────────────
-
 def detect_encoding(raw: bytes) -> str:
     """RTFヘッダのコードページ宣言からエンコーディングを推定する。"""
     head = raw[:512]
-    # \ansicpg932 → Shift_JIS (cp932)
     if re.search(rb'\\ansicpg932', head):
         return 'cp932'
-    # \ansicpg65001 → UTF-8
     if re.search(rb'\\ansicpg65001', head):
         return 'utf-8'
-    # ヘッダに宣言がない場合はバイト列で推定
     try:
         raw.decode('utf-8')
         return 'utf-8'
@@ -32,61 +25,60 @@ def detect_encoding(raw: bytes) -> str:
         return 'cp932'
 
 
-def decode_rtf_bytes(raw: bytes, encoding: str) -> str:
-    """バイト列をRTFテキストとしてデコードする（\'xx エスケープを処理）。"""
-    # \'xx エスケープ（RTFの非ASCII文字）を対応バイトに変換
-    def replace_hex(m):
-        byte_val = bytes([int(m.group(1), 16)])
-        try:
-            return byte_val.decode(encoding)
-        except Exception:
-            return ''
-
-    text = re.sub(rb"\\'([0-9a-fA-F]{2})", replace_hex, raw)
-
-    # 残りのバイト列をASCII範囲のみデコード（制御コードは無視）
-    if isinstance(text, bytes):
-        text = text.decode('ascii', errors='ignore')
-    return text
-
-
 def rtf_to_text(raw: bytes) -> str:
     """RTFバイナリからプレーンテキストを抽出する。"""
     encoding = detect_encoding(raw)
-    rtf = decode_rtf_bytes(raw, encoding)
 
-    # ── 改行・タブ制御コードを変換 ──
-    rtf = re.sub(r'\\par\b', '\n', rtf)
-    rtf = re.sub(r'\\line\b', '\n', rtf)
-    rtf = re.sub(r'\\tab\b', '\t', rtf)
-    rtf = re.sub(r'\\page\b', '\n\n', rtf)
-    rtf = re.sub(r'\\sect\b', '\n\n', rtf)
+    # ── UTF-8 RTF: バイト列に生のUTF-8が埋め込まれているケース ──
+    # latin-1 でデコードすると文字化けするので、先にUTF-8でデコードを試みる
+    if encoding == 'utf-8':
+        try:
+            text = raw.decode('utf-8')
+        except UnicodeDecodeError:
+            text = raw.decode('latin-1')
+    else:
+        # Shift_JIS RTF: \'xx エスケープで非ASCII文字が表現される
+        text = raw.decode('latin-1')
 
-    # ── 無視すべきグループ（フォントテーブル・カラーテーブル・スタイルシート等）を除去 ──
-    ignored = (
-        r'fonttbl', r'colortbl', r'stylesheet', r'listtable',
-        r'listoverridetable', r'rsidtbl', r'generator', r'info',
-        r'pict', r'object', r'fldinst',
-    )
-    for group in ignored:
-        pattern = r'\{[^{}]*\\' + group + r'[^{}]*(?:\{[^{}]*\}[^{}]*)?\}'
-        rtf = re.sub(pattern, '', rtf)
+    # ── Step 1: 最外の {} を除去（しないと全テキストがグループとして消える）──
+    text = text.strip()
+    if text.startswith('{') and text.endswith('}'):
+        text = text[1:-1]
 
-    # ── ネストしたグループを再帰的に除去（最大5パス）──
-    for _ in range(5):
-        rtf_new = re.sub(r'\{[^{}]*\}', '', rtf)
-        if rtf_new == rtf:
+    # ── Step 2: \'xx エスケープを変換（Shift_JIS用、連続するものをまとめてデコード）──
+    if encoding == 'cp932':
+        def decode_hex_runs(s: str, enc: str) -> str:
+            def replacer(m):
+                hex_vals = re.findall(r"\\'([0-9a-fA-F]{2})", m.group(0))
+                hex_bytes = bytes([int(x, 16) for x in hex_vals])
+                return hex_bytes.decode(enc, errors='replace')
+            return re.sub(r"(?:\\'[0-9a-fA-F]{2})+", replacer, s)
+        text = decode_hex_runs(text, encoding)
+
+    # ── Step 3: 改行・タブ系制御ワードをテキストに変換 ──
+    text = re.sub(r'\\par\b *',  '\n', text)
+    text = re.sub(r'\\pard\b *', '',   text)
+    text = re.sub(r'\\line\b *', '\n', text)
+    text = re.sub(r'\\tab\b *',  '\t', text)
+    text = re.sub(r'\\page\b *', '\n\n', text)
+    text = re.sub(r'\\sect\b *', '\n\n', text)
+    text = re.sub(r'\\cell\b *', '\t', text)
+    text = re.sub(r'\\row\b *',  '\n', text)
+
+    # ── Step 4: 内部グループを内側から除去（フォントテーブル等）──
+    for _ in range(30):
+        new = re.sub(r'\{[^{}]*\}', '', text)
+        if new == text:
             break
-        rtf = rtf_new
+        text = new
 
-    # ── RTF制御ワード・残余制御記号を除去 ──
-    rtf = re.sub(r'\\[a-zA-Z]+\-?\d*\s?', '', rtf)
-    rtf = re.sub(r'\\[^a-zA-Z]', '', rtf)
-    rtf = re.sub(r'[{}]', '', rtf)
+    # ── Step 5: 残り制御ワード・制御記号・波括弧を除去 ──
+    text = re.sub(r'\\[a-zA-Z]+-?\d* *', '', text)
+    text = re.sub(r'\\[^a-zA-Z\n]',       '', text)
+    text = re.sub(r'[{}]',                 '', text)
 
-    # ── 連続空白行を整理 ──
-    lines = [line.rstrip() for line in rtf.splitlines()]
-    # 3行以上連続する空行を2行に圧縮
+    # ── Step 6: 整形（連続空行を最大2行に圧縮）──
+    lines = [line.rstrip() for line in text.splitlines()]
     result, blank_count = [], 0
     for line in lines:
         if line == '':
@@ -99,8 +91,6 @@ def rtf_to_text(raw: bytes) -> str:
 
     return '\n'.join(result).strip()
 
-
-# ── メイン処理 ─────────────────────────────────────────────────────────
 
 def convert_folder(input_dir: str, output_dir: str | None, overwrite: bool) -> None:
     input_path = Path(input_dir)
@@ -122,7 +112,7 @@ def convert_folder(input_dir: str, output_dir: str | None, overwrite: bool) -> N
         txt_file = out_path / (rtf_file.stem + '.txt')
 
         if txt_file.exists() and not overwrite:
-            print(f"[SKIP] {rtf_file.name} → {txt_file.name} (既存ファイル。--overwrite で上書き可)")
+            print(f"[SKIP] {rtf_file.name} → {txt_file.name} (--overwrite で上書き可)")
             skipped += 1
             continue
 
@@ -141,11 +131,12 @@ def convert_folder(input_dir: str, output_dir: str | None, overwrite: bool) -> N
 
 def main():
     parser = argparse.ArgumentParser(
-        description='RTF → TXTを一括変換（Shift_JIS / UTF-8 混在対応）'
+        description='RTF → TXT 一括変換（Shift_JIS / UTF-8 混在対応）'
     )
-    parser.add_argument('input_dir',        help='RTFファイルが入っているフォルダのパス')
+    parser.add_argument('input_dir',
+                        help='RTFファイルが入っているフォルダのパス')
     parser.add_argument('-o', '--output_dir', default=None,
-                        help='テキストファイルの出力先フォルダ（省略時は input_dir と同じ）')
+                        help='出力先フォルダ（省略時は input_dir と同じ）')
     parser.add_argument('--overwrite', action='store_true',
                         help='既存の .txt ファイルを上書きする')
     args = parser.parse_args()
